@@ -20,7 +20,7 @@ env:
   # Bump these together: version + SHA-256 of the linux x86_64 release binary.
   OPENGREP_VERSION: "1.33.1"
   OPENGREP_SHA256: "46e8133cc490f9f50518061590ce2f6be5a08afaeda034471c0ceda4b3899808"
-  # Commit of https://github.com/opengrep/opengrep-rules used as the default ruleset.
+  # Commit of https://github.com/opengrep/opengrep-rules; only its */security/ rules are used.
   OPENGREP_RULES_SHA: "f1d2b562b414783763fd02a6ed2736eaed622efa"
   OSV_SCANNER_VERSION: "2.7.0"
   OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"
@@ -110,10 +110,14 @@ jobs:
           args=()
           # A relative config path keeps rule IDs short.
           rules=$(realpath --relative-to=. "$RUNNER_TEMP/opengrep-rules")
-          for d in "$rules"/*/; do
-            case $(basename "$d") in scripts|stats) continue ;; esac
+          # Security rules only: every */security/ directory. Style, correctness, i18n
+          # and AI-usage rules are skipped. Also skipped, as overlap or noise:
+          #   yaml/github-actions  - zizmor covers workflows
+          #   package-dependencies-check - flags every ^/~ range, even with a lockfile
+          rm -f "$rules/json/npm/security/package-dependencies-check.yml"
+          while IFS= read -r d; do
             args+=(--config "$d")
-          done
+          done < <(find "$rules" -type d -name security -not -path "$rules/yaml/github-actions/*" | sort)
           read -ra paths -d '' < <(tr ',' ' ' <<< "$EXCLUDE_PATHS") || true
           for p in "${paths[@]}"; do args+=(--exclude "$p"); done
           "$RUNNER_TEMP/opengrep" scan "${args[@]}" --sarif-output="$RUNNER_TEMP/opengrep.sarif" .
