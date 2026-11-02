@@ -1,0 +1,212 @@
+name: scan
+
+on:
+  workflow_call:
+    inputs:
+      fail-on-findings:
+        description: Fail the job when a scanner reports findings.
+        type: boolean
+        default: true
+      exclude-paths:
+        description: >-
+          Space- or comma-separated paths to skip. Passed to opengrep --exclude
+          and osv-scanner --x-exclude. gitleaks and zizmor use their own ignore files.
+        type: string
+        default: ""
+
+permissions: {}
+
+env:
+  # Bump these together: version + SHA-256 of the linux x86_64 release binary.
+  OPENGREP_VERSION: "1.33.1"
+  OPENGREP_SHA256: "46e8133cc490f9f50518061590ce2f6be5a08afaeda034471c0ceda4b3899808"
+  # Commit of https://github.com/opengrep/opengrep-rules used as the default ruleset.
+  OPENGREP_RULES_SHA: "f1d2b562b414783763fd02a6ed2736eaed622efa"
+  OSV_SCANNER_VERSION: "2.7.0"
+  OSV_SCANNER_SHA256: "160c6253e2922e9e0a6a9771c5c4c40a4b3c6090b34a3cdd5e80c96cc2e4218b"
+  FAIL_ON_FINDINGS: ${{ inputs.fail-on-findings }}
+  EXCLUDE_PATHS: ${{ inputs.exclude-paths }}
+  # Code scanning is unavailable on personal private repos and to fork PRs; skip uploads there.
+  CAN_UPLOAD: ${{ github.event.repository.private != true && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
+
+jobs:
+  gitleaks:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - id: scan
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+      - id: sarif
+        if: ${{ !cancelled() }}
+        run: if [ -s results.sarif ]; then echo "file=results.sarif" >> "$GITHUB_OUTPUT"; fi
+
+      - if: ${{ !cancelled() && steps.sarif.outputs.file && env.CAN_UPLOAD == 'true' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ steps.sarif.outputs.file }}
+          category: gitleaks
+
+      - name: Check results
+        if: ${{ !cancelled() }}
+        env:
+          SARIF: ${{ steps.sarif.outputs.file }}
+          OUTCOME: ${{ steps.scan.outcome }}
+        run: &check |
+          n=0
+          if [ -n "$SARIF" ]; then
+            n=$(jq '[.runs[].results[]] | length' "$SARIF")
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::unreadable SARIF"; exit 1; }
+            jq -r '.runs[].results[] | [.ruleId, (.locations[0].physicalLocation.artifactLocation.uri // ""), (.locations[0].physicalLocation.region.startLine // "" | tostring)] | @tsv' "$SARIF"
+          fi
+          echo "$n finding(s)"
+          if [ "$OUTCOME" = failure ] && [ "$n" -eq 0 ]; then echo "::error::scanner failed"; exit 1; fi
+          if [ "$n" -gt 0 ] && [ "$FAIL_ON_FINDINGS" = true ]; then exit 1; fi
+
+  opengrep:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install opengrep and rules
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/opengrep" \
+            "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_x86"
+          echo "${OPENGREP_SHA256}  $RUNNER_TEMP/opengrep" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/opengrep"
+          rules="$RUNNER_TEMP/opengrep-rules"
+          git init -q "$rules"
+          git -C "$rules" fetch -q --depth 1 https://github.com/opengrep/opengrep-rules "$OPENGREP_RULES_SHA"
+          git -C "$rules" checkout -q FETCH_HEAD
+
+      - id: scan
+        name: Scan
+        run: |
+          args=()
+          # A relative config path keeps rule IDs short.
+          rules=$(realpath --relative-to=. "$RUNNER_TEMP/opengrep-rules")
+          for d in "$rules"/*/; do
+            case $(basename "$d") in scripts|stats) continue ;; esac
+            args+=(--config "$d")
+          done
+          read -ra paths -d '' < <(tr ',' ' ' <<< "$EXCLUDE_PATHS") || true
+          for p in "${paths[@]}"; do args+=(--exclude "$p"); done
+          "$RUNNER_TEMP/opengrep" scan "${args[@]}" --sarif-output="$RUNNER_TEMP/opengrep.sarif" .
+          echo "file=$RUNNER_TEMP/opengrep.sarif" >> "$GITHUB_OUTPUT"
+
+      - if: ${{ !cancelled() && steps.scan.outputs.file && env.CAN_UPLOAD == 'true' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ steps.scan.outputs.file }}
+          category: opengrep
+
+      - name: Check results
+        if: ${{ !cancelled() }}
+        env:
+          SARIF: ${{ steps.scan.outputs.file }}
+          OUTCOME: ${{ steps.scan.outcome }}
+        run: *check
+
+  osv-scanner:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install osv-scanner
+        run: |
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/osv-scanner" \
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_amd64"
+          echo "${OSV_SCANNER_SHA256}  $RUNNER_TEMP/osv-scanner" | sha256sum -c -
+          chmod +x "$RUNNER_TEMP/osv-scanner"
+
+      - id: scan
+        name: Scan
+        run: |
+          args=()
+          read -ra paths -d '' < <(tr ',' ' ' <<< "$EXCLUDE_PATHS") || true
+          for p in "${paths[@]}"; do args+=(--x-exclude "$p"); done
+          sarif="$RUNNER_TEMP/osv.sarif"
+          rc=0
+          "$RUNNER_TEMP/osv-scanner" scan source --recursive --format sarif --output-file "$sarif" "${args[@]}" . || rc=$?
+          # 0 = clean, 1 = vulnerabilities found, 128 = no packages found
+          case $rc in
+            0 | 1) echo "file=$sarif" >> "$GITHUB_OUTPUT" ;;
+            128) echo "No lockfiles or manifests found" ;;
+            *) exit "$rc" ;;
+          esac
+
+      - if: ${{ !cancelled() && steps.scan.outputs.file && env.CAN_UPLOAD == 'true' }}
+        uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
+        with:
+          sarif_file: ${{ steps.scan.outputs.file }}
+          category: osv-scanner
+
+      - name: Check results
+        if: ${{ !cancelled() }}
+        env:
+          SARIF: ${{ steps.scan.outputs.file }}
+          OUTCOME: ${{ steps.scan.outcome }}
+        run: *check
+
+  zizmor:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Writes SARIF and uploads it with codeql-action/upload-sarif internally.
+      # That upload fails where code scanning is unavailable, so results are judged from the SARIF.
+      - id: scan
+        uses: zizmorcore/zizmor-action@53290badfa369cb0bf7ad16342cb62c2fa47ac7b # v0.8.0
+        continue-on-error: true
+        with:
+          inputs: .github/workflows
+
+      - name: Check results
+        if: ${{ !cancelled() }}
+        env:
+          SARIF: ${{ steps.scan.outputs.output-file }}
+          OUTCOME: ${{ steps.scan.outcome }}
+        run: *check

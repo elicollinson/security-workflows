@@ -1,0 +1,38 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    permissions:
+      contents: read
+      security-events: write
+    # This repo scans itself with the local copy. Other repos pin a commit SHA; see README.
+    # `$/` self-repository syntax would be preferred, but actionlint doesn't parse it yet (rhysd/actionlint#711).
+    uses: ./.github/workflows/scan.yml # zizmor: ignore[self-repository]
+
+  # Single required check for rulesets: passes only if every scan job passed.
+  security:
+    if: ${{ always() }}
+    needs: scan
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43 # v2.22.3
+        with:
+          egress-policy: audit
+      - env:
+          RESULT: ${{ needs.scan.result }}
+        run: test "$RESULT" = success
