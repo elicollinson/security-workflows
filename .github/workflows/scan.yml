@@ -72,6 +72,7 @@ jobs:
           n=0
           if [ -n "$SARIF" ]; then
             n=$(jq '[.runs[].results[]] | length' "$SARIF")
+            [[ "$n" =~ ^[0-9]+$ ]] || { echo "::error::unreadable SARIF"; exit 1; }
             jq -r '.runs[].results[] | [.ruleId, (.locations[0].physicalLocation.artifactLocation.uri // ""), (.locations[0].physicalLocation.region.startLine // "" | tostring)] | @tsv' "$SARIF"
           fi
           echo "$n finding(s)"
