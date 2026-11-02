@@ -9,7 +9,7 @@ Each job starts with `step-security/harden-runner` (egress audit), checks out wi
 | Job | What it does |
 | --- | --- |
 | `gitleaks` | Runs `gitleaks/gitleaks-action` on a full-history clone (`fetch-depth: 0`). The action decides the commit range from the event: pull requests scan the PR's commits, pushes scan the pushed commits, and schedule or manual runs scan the whole history. The weekly run is the full-history sweep. |
-| `opengrep` | Downloads the opengrep release binary, checks its SHA-256, and scans the repo with the [opengrep-rules](https://github.com/opengrep/opengrep-rules) ruleset (the language directories, pinned to a commit). Writes SARIF. |
+| `opengrep` | Downloads the opengrep release binary, checks its SHA-256, and scans the repo with the security rules from [opengrep-rules](https://github.com/opengrep/opengrep-rules) (every `*/security/` directory, pinned to a commit). It skips style, correctness, i18n and AI-SDK-usage rules, the GitHub Actions rules (zizmor covers those) and `package-dependencies-check` (it flags every `^`/`~` range even when a lockfile pins the version). Writes SARIF. |
 | `osv-scanner` | Downloads the osv-scanner release binary, checks its SHA-256, and runs `scan source --recursive` against every lockfile and manifest it finds. Writes SARIF. A repo with no lockfiles passes. |
 | `zizmor` | Runs `zizmorcore/zizmor-action` on `.github/workflows` with online audits enabled. |
 
